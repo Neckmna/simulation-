@@ -1,127 +1,400 @@
 import os
 import logging
 import asyncio
-from telegram import Update
+import json
+import re
+import tempfile
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from debate_engine import DebateEngine
+from telegram.constants import ParseMode
+from openai import OpenAI
+from tavily import TavilyClient
+from pdf_generator import generate_debate_pdf
+import base64
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
-engine = DebateEngine(GEMINI_API_KEY)
+nvidia_client = OpenAI(
+    base_url="https://integrate.api.nvidia.com/v1",
+    api_key=NVIDIA_API_KEY
+)
+tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
 
-INTRO = """
-⚔️ *ARENA — 100 AI Minds Debate Your Question*
+SYSTEM_PROMPT = """You are a debate simulation engine controlling 100 distinct expert personas.
+Each persona has deep knowledge across ALL domains: trading/finance, sports (football, cricket, UFC), 
+politics, military history, science, economics, and current events.
 
-Send me any question or topic and watch 100 AI personas tear it apart with data, logic, and raw debate firepower.
+The 100 personas are:
+1-10: Sports Analysts (football, cricket, UFC, tennis, F1, basketball, rugby, baseball, golf, athletics)
+11-20: Financial Experts (trader, economist, hedge fund manager, risk analyst, quant, CFO, central banker, VC, forex specialist, crypto analyst)
+21-30: Political Scientists (geopolitics, military strategy, diplomacy, conflict analyst, historian, war strategist, intelligence analyst, sanctions expert, UN analyst, regional specialist)
+31-40: Scientists (physicist, biologist, statistician, data scientist, AI researcher, climate scientist, neuroscientist, mathematician, chemist, astronomer)
+41-50: Contrarians/Devil Advocates (skeptic, pessimist, contrarian trader, black swan theorist, crash predictor, anti-consensus thinker x5, chaos theorist, randomness expert, uncertainty specialist)
+51-60: Optimists/Bulls (optimist, bull analyst, growth theorist, momentum trader, trend follower x5, recovery specialist, upside hunter, opportunity seeker)
+61-70: Historians (ancient, medieval, modern, military, economic, sports, political, cultural, technological, scientific historians)
+71-80: Psychologists/Behavioralists (crowd psychology, trader psychology, sports psychology, political psychology, behavioral economist x5, decision theorist, bias analyst, emotion specialist)
+81-90: Journalists/Investigators (sports journalist, financial journalist, war correspondent, political reporter, investigative journalist x5, data journalist, fact checker, source analyst)
+91-100: Wildcards (philosopher, ethicist, futurist, game theorist, conspiracy analyst, insider trader [fictional], locker room informant [fictional], street analyst, gut instinct expert, chaos agent)
 
-*Topics I eat for breakfast:*
-🏆 Football, Cricket, UFC
-📈 Trading, Markets, Crypto
-🌍 Politics, War, History
-💡 Science, Tech, Philosophy
-🎯 Literally anything
+IMPORTANT RULES:
+- Every argument MUST be backed by specific data, statistics, historical facts, or logical reasoning
+- Personas DISAGREE strongly - no quick consensus
+- Use the real-time data provided to make arguments current and relevant
+- Be specific: name teams, players, dates, prices, events
+- Arguments should feel like real expert debate, not generic opinions"""
 
-Just send your question. No fluff. Let the arena decide.
-"""
+async def fetch_realtime_data(query: str) -> str:
+    try:
+        result = tavily_client.search(
+            query=query,
+            search_depth="advanced",
+            max_results=5,
+            include_answer=True
+        )
+        context = f"REAL-TIME DATA (fetched now):\n"
+        if result.get("answer"):
+            context += f"Summary: {result['answer']}\n\n"
+        context += "Sources:\n"
+        for r in result.get("results", [])[:5]:
+            context += f"- {r.get('title', '')}: {r.get('content', '')[:300]}\n"
+        return context
+    except Exception as e:
+        logger.error(f"Tavily error: {e}")
+        return "Real-time data unavailable. Use your training knowledge."
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(INTRO, parse_mode="Markdown")
+def run_debate_round(question: str, realtime_data: str, round_num: int, prev_arguments: str = "") -> dict:
+    if round_num == 1:
+        prompt = f"""QUESTION: {question}
 
-async def handle_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    question = update.message.text.strip()
-    if not question:
+{realtime_data}
+
+TASK - ROUND 1: Simulate 100 expert personas each giving their position with data-backed reasoning.
+
+Format your response as JSON:
+{{
+  "round": 1,
+  "positions": [
+    {{
+      "id": 1,
+      "persona": "Sports Analyst #1 (Football)",
+      "position": "Brief stance in 5 words",
+      "argument": "2-3 sentences with specific data/stats/facts",
+      "confidence": 85,
+      "key_data_point": "The most important fact supporting this view"
+    }}
+    ... (all 100 personas)
+  ]
+}}
+
+Make them DISAGREE. Use specific numbers, names, dates. No vague opinions."""
+
+    else:
+        prompt = f"""QUESTION: {question}
+
+{realtime_data}
+
+ROUND 1 ARGUMENTS SUMMARY:
+{prev_arguments}
+
+TASK - ROUND 2: The top 10 strongest personas now challenge each other aggressively.
+They attack weak arguments, defend their position with NEW data points, and try to win.
+
+Format your response as JSON:
+{{
+  "round": 2,
+  "top_debaters": [
+    {{
+      "id": 1,
+      "persona": "Sports Analyst #1",
+      "original_position": "Their round 1 stance",
+      "counter_attack": "Attack on the strongest opposing argument with data",
+      "defense": "Why their position still holds with new evidence",
+      "updated_confidence": 90,
+      "strength_score": 8.5,
+      "key_evidence": "Strongest data point after round 2"
+    }}
+    ... (top 10 debaters)
+  ],
+  "eliminated": ["list of persona types whose arguments collapsed"],
+  "emerging_consensus": "Brief note on which side is winning or if still split"
+}}"""
+
+    response = nvidia_client.chat.completions.create(
+        model="moonshotai/kimi-k2.6",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.8,
+        max_tokens=4000
+    )
+    
+    raw = response.choices[0].message.content
+    json_match = re.search(r'\{[\s\S]*\}', raw)
+    if json_match:
+        try:
+            return json.loads(json_match.group())
+        except:
+            pass
+    return {"raw": raw}
+
+def pick_winner(question: str, realtime_data: str, round1: dict, round2: dict) -> dict:
+    r1_summary = json.dumps(round1, indent=2)[:2000]
+    r2_summary = json.dumps(round2, indent=2)[:2000]
+    
+    prompt = f"""QUESTION: {question}
+
+{realtime_data}
+
+ROUND 1 DATA: {r1_summary}
+ROUND 2 DATA: {r2_summary}
+
+TASK: Analyze both rounds and declare the winning argument. Be a strict judge.
+
+Format as JSON:
+{{
+  "winner": {{
+    "persona": "Winning persona type",
+    "final_verdict": "The definitive answer to the question in 2-3 sentences",
+    "overall_rating": 9.2,
+    "why_won": "Why this argument was stronger than others",
+    "key_data_points": ["data point 1", "data point 2", "data point 3", "data point 4", "data point 5"],
+    "confidence_level": "HIGH/MEDIUM/LOW",
+    "caveats": "What could change this verdict"
+  }},
+  "top_5": [
+    {{
+      "rank": 1,
+      "persona": "Persona name",
+      "position": "Their stance",
+      "score": 9.2,
+      "strongest_argument": "Their best point",
+      "weakness": "Where they fell short"
+    }}
+    ... (5 total)
+  ],
+  "bottom_line": "One sentence final answer",
+  "dissenting_view": "Strongest opposing argument that didn't win"
+}}"""
+
+    response = nvidia_client.chat.completions.create(
+        model="moonshotai/kimi-k2.6",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.4,
+        max_tokens=2000
+    )
+    
+    raw = response.choices[0].message.content
+    json_match = re.search(r'\{[\s\S]*\}', raw)
+    if json_match:
+        try:
+            return json.loads(json_match.group())
+        except:
+            pass
+    return {"raw": raw}
+
+def format_telegram_message(question: str, result: dict) -> str:
+    top5 = result.get("top_5", [])
+    winner = result.get("winner", {})
+    bottom_line = result.get("bottom_line", "")
+    dissent = result.get("dissenting_view", "")
+
+    score_bars = {
+        range(9, 11): "🟢🟢🟢🟢🟢",
+        range(8, 9): "🟢🟢🟢🟢⚪",
+        range(7, 8): "🟢🟢🟢⚪⚪",
+        range(6, 7): "🟢🟢⚪⚪⚪",
+        range(0, 6): "🟢⚪⚪⚪⚪"
+    }
+
+    def get_bar(score):
+        for r, bar in score_bars.items():
+            if int(score) in r:
+                return bar
+        return "⚪⚪⚪⚪⚪"
+
+    msg = f"🧠 *100 BRAIN DEBATE COMPLETE*\n"
+    msg += f"━━━━━━━━━━━━━━━━━━━━\n"
+    msg += f"❓ *Question:* {question}\n\n"
+
+    msg += f"🏆 *WINNER: {winner.get('persona', 'Unknown')}*\n"
+    msg += f"📊 Rating: `{winner.get('overall_rating', 0)}/10` {get_bar(winner.get('overall_rating', 0))}\n"
+    msg += f"🎯 Confidence: `{winner.get('confidence_level', 'N/A')}`\n\n"
+
+    msg += f"✅ *VERDICT:*\n_{winner.get('final_verdict', '')}_\n\n"
+
+    msg += f"📌 *KEY DATA POINTS:*\n"
+    for i, dp in enumerate(winner.get('key_data_points', [])[:5], 1):
+        msg += f"  {i}. {dp}\n"
+
+    msg += f"\n━━━━━━━━━━━━━━━━━━━━\n"
+    msg += f"🔥 *TOP 5 DEBATERS:*\n\n"
+
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+    for i, debater in enumerate(top5[:5]):
+        score = debater.get('score', 0)
+        msg += f"{medals[i]} *{debater.get('persona', '')}*\n"
+        msg += f"   Score: `{score}/10` {get_bar(score)}\n"
+        msg += f"   📍 _{debater.get('position', '')}_\n"
+        msg += f"   💪 {debater.get('strongest_argument', '')}\n"
+        msg += f"   ⚠️ Weakness: {debater.get('weakness', '')}\n\n"
+
+    msg += f"━━━━━━━━━━━━━━━━━━━━\n"
+    msg += f"💬 *BOTTOM LINE:*\n_{bottom_line}_\n\n"
+    msg += f"🔴 *DISSENTING VIEW:*\n_{dissent}_\n\n"
+    msg += f"📄 _Full debate report attached as PDF_"
+
+    return msg
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    question = None
+    image_data = None
+
+    if message.photo:
+        photo = message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        file_bytes = await file.download_as_bytearray()
+        image_data = base64.b64encode(file_bytes).decode("utf-8")
+        question = message.caption or "Analyze this image and debate what it shows"
+    elif message.document and message.document.mime_type.startswith("image/"):
+        file = await context.bot.get_file(message.document.file_id)
+        file_bytes = await file.download_as_bytearray()
+        image_data = base64.b64encode(file_bytes).decode("utf-8")
+        question = message.caption or "Analyze this image and debate what it shows"
+    elif message.text:
+        question = message.text
+    else:
+        await message.reply_text("Send me a question or an image!")
         return
 
-    user = update.message.from_user.first_name or "Challenger"
-    
-    # Send loading message
-    loading_msg = await update.message.reply_text(
-        f"🧠 *Arena activated, {user}.*\n\n"
-        "⚡ Round 1 — 100 minds forming positions...\n"
-        "_(This takes ~20–30 seconds. Real debate takes time.)_",
-        parse_mode="Markdown"
+    status_msg = await message.reply_text(
+        "🧠 *Debate starting...*\n\n"
+        "🔍 Fetching real-time data...",
+        parse_mode=ParseMode.MARKDOWN
     )
 
     try:
-        # Run debate
-        result = await engine.run_debate(question)
+        realtime_data = await fetch_realtime_data(question)
 
-        # Update to round 2
-        await loading_msg.edit_text(
-            f"🧠 *Arena activated, {user}.*\n\n"
-            "✅ Round 1 — 100 positions captured\n"
-            "⚔️ Round 2 — Top 5 gladiators clashing...",
-            parse_mode="Markdown"
+        await status_msg.edit_text(
+            "🧠 *Debate in progress...*\n\n"
+            "✅ Real-time data fetched\n"
+            "⚔️ Round 1: 100 brains forming positions...",
+            parse_mode=ParseMode.MARKDOWN
         )
 
-        # Send final result
-        await asyncio.sleep(1)
-        await loading_msg.edit_text(
-            f"🧠 *Arena activated, {user}.*\n\n"
-            "✅ Round 1 — 100 positions captured\n"
-            "✅ Round 2 — Champions have clashed\n"
-            "🏆 Verdict incoming...",
-            parse_mode="Markdown"
+        if image_data:
+            vision_response = nvidia_client.chat.completions.create(
+                model="moonshotai/kimi-k2.6",
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"Analyze this image in detail for debate context about: {question}"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
+                    ]
+                }],
+                max_tokens=500
+            )
+            image_analysis = vision_response.choices[0].message.content
+            realtime_data = f"IMAGE ANALYSIS:\n{image_analysis}\n\n{realtime_data}"
+
+        round1 = await asyncio.get_event_loop().run_in_executor(
+            None, run_debate_round, question, realtime_data, 1, ""
         )
 
-        await asyncio.sleep(1)
+        r1_summary = ""
+        positions = round1.get("positions", [])
+        if positions:
+            for p in positions[:20]:
+                r1_summary += f"- {p.get('persona', '')}: {p.get('position', '')} (confidence: {p.get('confidence', 0)}%)\n"
 
-        # Split result if too long for Telegram (4096 char limit)
-        chunks = split_message(result)
-        for i, chunk in enumerate(chunks):
-            if i == 0:
-                await update.message.reply_text(chunk, parse_mode="Markdown")
-            else:
-                await update.message.reply_text(chunk, parse_mode="Markdown")
+        await status_msg.edit_text(
+            "🧠 *Debate in progress...*\n\n"
+            "✅ Real-time data fetched\n"
+            "✅ Round 1 complete — 100 positions formed\n"
+            "🔥 Round 2: Top debaters clashing...",
+            parse_mode=ParseMode.MARKDOWN
+        )
 
-        await loading_msg.delete()
+        round2 = await asyncio.get_event_loop().run_in_executor(
+            None, run_debate_round, question, realtime_data, 2, r1_summary
+        )
+
+        await status_msg.edit_text(
+            "🧠 *Debate in progress...*\n\n"
+            "✅ Real-time data fetched\n"
+            "✅ Round 1 complete\n"
+            "✅ Round 2 complete\n"
+            "⚖️ Picking winner...",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+        final_result = await asyncio.get_event_loop().run_in_executor(
+            None, pick_winner, question, realtime_data, round1, round2
+        )
+
+        await status_msg.edit_text(
+            "🧠 *Debate in progress...*\n\n"
+            "✅ Real-time data fetched\n"
+            "✅ Round 1 complete\n"
+            "✅ Round 2 complete\n"
+            "✅ Winner selected\n"
+            "📄 Generating PDF report...",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+        telegram_msg = format_telegram_message(question, final_result)
+
+        pdf_path = await asyncio.get_event_loop().run_in_executor(
+            None, generate_debate_pdf, question, realtime_data, round1, round2, final_result
+        )
+
+        await status_msg.delete()
+        await message.reply_text(telegram_msg, parse_mode=ParseMode.MARKDOWN)
+
+        with open(pdf_path, "rb") as pdf_file:
+            await message.reply_document(
+                document=pdf_file,
+                filename=f"debate_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                caption="📄 Full debate analysis report"
+            )
+
+        os.unlink(pdf_path)
 
     except Exception as e:
-        logger.error(f"Debate failed: {e}")
-        await loading_msg.edit_text(
-            "❌ The arena crashed. Even 100 AI minds have limits.\n"
-            f"Error: `{str(e)[:200]}`",
-            parse_mode="Markdown"
-        )
+        logger.error(f"Error: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ Error: {str(e)}\n\nTry again.")
 
-def split_message(text: str, limit: int = 4000) -> list[str]:
-    """Split long messages into chunks for Telegram."""
-    if len(text) <= limit:
-        return [text]
-    
-    chunks = []
-    while len(text) > limit:
-        split_at = text.rfind('\n', 0, limit)
-        if split_at == -1:
-            split_at = limit
-        chunks.append(text[:split_at])
-        text = text[split_at:].lstrip('\n')
-    
-    if text:
-        chunks.append(text)
-    
-    return chunks
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🧠 *100 BRAIN DEBATE BOT*\n\n"
+        "Send me any question and 100 AI personas will debate it using real-time data.\n\n"
+        "📌 *Topics I handle:*\n"
+        "⚽ Football, 🏏 Cricket, 🥊 UFC\n"
+        "📈 Trading & Markets\n"
+        "🏛️ Politics & War\n"
+        "🌍 Anything else\n\n"
+        "📸 You can also send an *image* for visual debate analysis!\n\n"
+        "Just send your question to start!",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 def main():
-    if not TELEGRAM_TOKEN:
-        raise ValueError("TELEGRAM_TOKEN environment variable not set")
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY environment variable not set")
-
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_question))
-
-    logger.info("Arena bot is live.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, handle_message))
+    logger.info("Bot started")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()

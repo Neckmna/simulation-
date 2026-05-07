@@ -3,9 +3,8 @@ import logging
 import asyncio
 import json
 import re
-import tempfile
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ParseMode
 from openai import OpenAI
@@ -26,8 +25,58 @@ nvidia_client = OpenAI(
 )
 tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
 
+# Fallback chain — tries each model in order until one works
+NVIDIA_MODELS = [
+    "moonshotai/kimi-k2-instruct",   # primary — best reasoning
+    "google/gemma-4-31b-it",         # fallback 1
+    "z-ai/glm-5.1",                  # fallback 2
+    "moonshotai/kimi-k2.6",          # fallback 3
+]
+
+VISION_MODELS = [
+    "moonshotai/kimi-k2-instruct",
+    "moonshotai/kimi-k2.6",
+]
+
+def call_nvidia(messages, temperature=0.8, max_tokens=4000):
+    last_error = None
+    for model in NVIDIA_MODELS:
+        try:
+            logger.info(f"Trying model: {model}")
+            response = nvidia_client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+            logger.info(f"Success with: {model}")
+            return response.choices[0].message.content
+        except Exception as e:
+            logger.warning(f"{model} failed: {e}")
+            last_error = e
+            continue
+    raise Exception(f"All models failed. Last error: {last_error}")
+
+def call_nvidia_vision(content, max_tokens=500):
+    last_error = None
+    for model in VISION_MODELS:
+        try:
+            logger.info(f"Trying vision model: {model}")
+            response = nvidia_client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": content}],
+                max_tokens=max_tokens
+            )
+            logger.info(f"Vision success with: {model}")
+            return response.choices[0].message.content
+        except Exception as e:
+            logger.warning(f"Vision {model} failed: {e}")
+            last_error = e
+            continue
+    raise Exception(f"All vision models failed. Last error: {last_error}")
+
 SYSTEM_PROMPT = """You are a debate simulation engine controlling 100 distinct expert personas.
-Each persona has deep knowledge across ALL domains: trading/finance, sports (football, cricket, UFC), 
+Each persona has deep knowledge across ALL domains: trading/finance, sports (football, cricket, UFC),
 politics, military history, science, economics, and current events.
 
 The 100 personas are:
@@ -57,7 +106,7 @@ async def fetch_realtime_data(query: str) -> str:
             max_results=5,
             include_answer=True
         )
-        context = f"REAL-TIME DATA (fetched now):\n"
+        context = "REAL-TIME DATA (fetched now):\n"
         if result.get("answer"):
             context += f"Summary: {result['answer']}\n\n"
         context += "Sources:\n"
@@ -88,11 +137,10 @@ Format your response as JSON:
       "confidence": 85,
       "key_data_point": "The most important fact supporting this view"
     }}
-    ... (all 100 personas)
   ]
 }}
 
-Make them DISAGREE. Use specific numbers, names, dates. No vague opinions."""
+Generate all 100 personas. Make them DISAGREE. Use specific numbers, names, dates. No vague opinions."""
 
     else:
         prompt = f"""QUESTION: {question}
@@ -119,14 +167,12 @@ Format your response as JSON:
       "strength_score": 8.5,
       "key_evidence": "Strongest data point after round 2"
     }}
-    ... (top 10 debaters)
   ],
   "eliminated": ["list of persona types whose arguments collapsed"],
   "emerging_consensus": "Brief note on which side is winning or if still split"
 }}"""
 
-    response = nvidia_client.chat.completions.create(
-        model="moonshotai/kimi-k2.6",
+    raw = call_nvidia(
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
@@ -134,8 +180,6 @@ Format your response as JSON:
         temperature=0.8,
         max_tokens=4000
     )
-    
-    raw = response.choices[0].message.content
     json_match = re.search(r'\{[\s\S]*\}', raw)
     if json_match:
         try:
@@ -147,7 +191,7 @@ Format your response as JSON:
 def pick_winner(question: str, realtime_data: str, round1: dict, round2: dict) -> dict:
     r1_summary = json.dumps(round1, indent=2)[:2000]
     r2_summary = json.dumps(round2, indent=2)[:2000]
-    
+
     prompt = f"""QUESTION: {question}
 
 {realtime_data}
@@ -177,14 +221,12 @@ Format as JSON:
       "strongest_argument": "Their best point",
       "weakness": "Where they fell short"
     }}
-    ... (5 total)
   ],
   "bottom_line": "One sentence final answer",
   "dissenting_view": "Strongest opposing argument that didn't win"
 }}"""
 
-    response = nvidia_client.chat.completions.create(
-        model="moonshotai/kimi-k2.6",
+    raw = call_nvidia(
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
@@ -192,8 +234,6 @@ Format as JSON:
         temperature=0.4,
         max_tokens=2000
     )
-    
-    raw = response.choices[0].message.content
     json_match = re.search(r'\{[\s\S]*\}', raw)
     if json_match:
         try:
@@ -208,37 +248,29 @@ def format_telegram_message(question: str, result: dict) -> str:
     bottom_line = result.get("bottom_line", "")
     dissent = result.get("dissenting_view", "")
 
-    score_bars = {
-        range(9, 11): "🟢🟢🟢🟢🟢",
-        range(8, 9): "🟢🟢🟢🟢⚪",
-        range(7, 8): "🟢🟢🟢⚪⚪",
-        range(6, 7): "🟢🟢⚪⚪⚪",
-        range(0, 6): "🟢⚪⚪⚪⚪"
-    }
-
     def get_bar(score):
-        for r, bar in score_bars.items():
-            if int(score) in r:
-                return bar
-        return "⚪⚪⚪⚪⚪"
+        try:
+            s = int(float(score))
+        except:
+            s = 0
+        if s >= 9: return "🟢🟢🟢🟢🟢"
+        if s >= 8: return "🟢🟢🟢🟢⚪"
+        if s >= 7: return "🟢🟢🟢⚪⚪"
+        if s >= 6: return "🟢🟢⚪⚪⚪"
+        return "🟢⚪⚪⚪⚪"
 
-    msg = f"🧠 *100 BRAIN DEBATE COMPLETE*\n"
-    msg += f"━━━━━━━━━━━━━━━━━━━━\n"
+    msg = "🧠 *100 BRAIN DEBATE COMPLETE*\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"❓ *Question:* {question}\n\n"
-
     msg += f"🏆 *WINNER: {winner.get('persona', 'Unknown')}*\n"
     msg += f"📊 Rating: `{winner.get('overall_rating', 0)}/10` {get_bar(winner.get('overall_rating', 0))}\n"
     msg += f"🎯 Confidence: `{winner.get('confidence_level', 'N/A')}`\n\n"
-
     msg += f"✅ *VERDICT:*\n_{winner.get('final_verdict', '')}_\n\n"
-
-    msg += f"📌 *KEY DATA POINTS:*\n"
+    msg += "📌 *KEY DATA POINTS:*\n"
     for i, dp in enumerate(winner.get('key_data_points', [])[:5], 1):
         msg += f"  {i}. {dp}\n"
-
-    msg += f"\n━━━━━━━━━━━━━━━━━━━━\n"
-    msg += f"🔥 *TOP 5 DEBATERS:*\n\n"
-
+    msg += "\n━━━━━━━━━━━━━━━━━━━━\n"
+    msg += "🔥 *TOP 5 DEBATERS:*\n\n"
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
     for i, debater in enumerate(top5[:5]):
         score = debater.get('score', 0)
@@ -247,12 +279,10 @@ def format_telegram_message(question: str, result: dict) -> str:
         msg += f"   📍 _{debater.get('position', '')}_\n"
         msg += f"   💪 {debater.get('strongest_argument', '')}\n"
         msg += f"   ⚠️ Weakness: {debater.get('weakness', '')}\n\n"
-
-    msg += f"━━━━━━━━━━━━━━━━━━━━\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"💬 *BOTTOM LINE:*\n_{bottom_line}_\n\n"
     msg += f"🔴 *DISSENTING VIEW:*\n_{dissent}_\n\n"
-    msg += f"📄 _Full debate report attached as PDF_"
-
+    msg += "📄 _Full debate report attached as PDF_"
     return msg
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -278,8 +308,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     status_msg = await message.reply_text(
-        "🧠 *Debate starting...*\n\n"
-        "🔍 Fetching real-time data...",
+        "🧠 *Debate starting...*\n\n🔍 Fetching real-time data...",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -294,18 +323,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if image_data:
-            vision_response = nvidia_client.chat.completions.create(
-                model="moonshotai/kimi-k2.6",
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": f"Analyze this image in detail for debate context about: {question}"},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
-                    ]
-                }],
-                max_tokens=500
+            image_analysis = await asyncio.get_event_loop().run_in_executor(
+                None, call_nvidia_vision,
+                [
+                    {"type": "text", "text": f"Analyze this image in detail for debate context about: {question}"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
+                ]
             )
-            image_analysis = vision_response.choices[0].message.content
             realtime_data = f"IMAGE ANALYSIS:\n{image_analysis}\n\n{realtime_data}"
 
         round1 = await asyncio.get_event_loop().run_in_executor(

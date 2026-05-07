@@ -25,12 +25,11 @@ nvidia_client = OpenAI(
 )
 tavily_client = TavilyClient(api_key=TAVILY_API_KEY)
 
-# Fallback chain — tries each model in order until one works
 NVIDIA_MODELS = [
-    "moonshotai/kimi-k2-instruct",   # primary — best reasoning
-    "google/gemma-4-31b-it",         # fallback 1
-    "z-ai/glm-5.1",                  # fallback 2
-    "moonshotai/kimi-k2.6",          # fallback 3
+    "moonshotai/kimi-k2-instruct",
+    "google/gemma-4-31b-it",
+    "z-ai/glm-5.1",
+    "moonshotai/kimi-k2.6",
 ]
 
 VISION_MODELS = [
@@ -61,13 +60,11 @@ def call_nvidia_vision(content, max_tokens=500):
     last_error = None
     for model in VISION_MODELS:
         try:
-            logger.info(f"Trying vision model: {model}")
             response = nvidia_client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": content}],
                 max_tokens=max_tokens
             )
-            logger.info(f"Vision success with: {model}")
             return response.choices[0].message.content
         except Exception as e:
             logger.warning(f"Vision {model} failed: {e}")
@@ -75,25 +72,13 @@ def call_nvidia_vision(content, max_tokens=500):
             continue
     raise Exception(f"All vision models failed. Last error: {last_error}")
 
-SYSTEM_PROMPT = """You are a debate simulation engine controlling 100 distinct expert personas.
-Each persona has deep knowledge across ALL domains: trading/finance, sports (football, cricket, UFC),
+SYSTEM_PROMPT = """You are a debate engine. Two expert personas are chosen based on the question topic.
+They have deep knowledge across ALL domains: trading/finance, sports (football, cricket, UFC),
 politics, military history, science, economics, and current events.
-
-The 100 personas are:
-1-10: Sports Analysts (football, cricket, UFC, tennis, F1, basketball, rugby, baseball, golf, athletics)
-11-20: Financial Experts (trader, economist, hedge fund manager, risk analyst, quant, CFO, central banker, VC, forex specialist, crypto analyst)
-21-30: Political Scientists (geopolitics, military strategy, diplomacy, conflict analyst, historian, war strategist, intelligence analyst, sanctions expert, UN analyst, regional specialist)
-31-40: Scientists (physicist, biologist, statistician, data scientist, AI researcher, climate scientist, neuroscientist, mathematician, chemist, astronomer)
-41-50: Contrarians/Devil Advocates (skeptic, pessimist, contrarian trader, black swan theorist, crash predictor, anti-consensus thinker x5, chaos theorist, randomness expert, uncertainty specialist)
-51-60: Optimists/Bulls (optimist, bull analyst, growth theorist, momentum trader, trend follower x5, recovery specialist, upside hunter, opportunity seeker)
-61-70: Historians (ancient, medieval, modern, military, economic, sports, political, cultural, technological, scientific historians)
-71-80: Psychologists/Behavioralists (crowd psychology, trader psychology, sports psychology, political psychology, behavioral economist x5, decision theorist, bias analyst, emotion specialist)
-81-90: Journalists/Investigators (sports journalist, financial journalist, war correspondent, political reporter, investigative journalist x5, data journalist, fact checker, source analyst)
-91-100: Wildcards (philosopher, ethicist, futurist, game theorist, conspiracy analyst, insider trader [fictional], locker room informant [fictional], street analyst, gut instinct expert, chaos agent)
 
 IMPORTANT RULES:
 - Every argument MUST be backed by specific data, statistics, historical facts, or logical reasoning
-- Personas DISAGREE strongly - no quick consensus
+- The two personas MUST strongly disagree with each other
 - Use the real-time data provided to make arguments current and relevant
 - Be specific: name teams, players, dates, prices, events
 - Arguments should feel like real expert debate, not generic opinions"""
@@ -117,59 +102,40 @@ async def fetch_realtime_data(query: str) -> str:
         logger.error(f"Tavily error: {e}")
         return "Real-time data unavailable. Use your training knowledge."
 
-def run_debate_round(question: str, realtime_data: str, round_num: int, prev_arguments: str = "") -> dict:
-    if round_num == 1:
-        prompt = f"""QUESTION: {question}
+def run_debate(question: str, realtime_data: str) -> dict:
+    prompt = f"""QUESTION: {question}
 
 {realtime_data}
 
-TASK - ROUND 1: Simulate 100 expert personas each giving their position with data-backed reasoning.
+TASK: Pick the 2 best expert personas suited for this question topic. Have them debate with strong opposing views backed by real data.
 
 Format your response as JSON:
 {{
-  "round": 1,
-  "positions": [
-    {{
-      "id": 1,
-      "persona": "Sports Analyst #1 (Football)",
-      "position": "Brief stance in 5 words",
-      "argument": "2-3 sentences with specific data/stats/facts",
-      "confidence": 85,
-      "key_data_point": "The most important fact supporting this view"
-    }}
-  ]
-}}
-
-Generate all 100 personas. Make them DISAGREE. Use specific numbers, names, dates. No vague opinions."""
-
-    else:
-        prompt = f"""QUESTION: {question}
-
-{realtime_data}
-
-ROUND 1 ARGUMENTS SUMMARY:
-{prev_arguments}
-
-TASK - ROUND 2: The top 10 strongest personas now challenge each other aggressively.
-They attack weak arguments, defend their position with NEW data points, and try to win.
-
-Format your response as JSON:
-{{
-  "round": 2,
-  "top_debaters": [
-    {{
-      "id": 1,
-      "persona": "Sports Analyst #1",
-      "original_position": "Their round 1 stance",
-      "counter_attack": "Attack on the strongest opposing argument with data",
-      "defense": "Why their position still holds with new evidence",
-      "updated_confidence": 90,
-      "strength_score": 8.5,
-      "key_evidence": "Strongest data point after round 2"
-    }}
-  ],
-  "eliminated": ["list of persona types whose arguments collapsed"],
-  "emerging_consensus": "Brief note on which side is winning or if still split"
+  "persona_a": {{
+    "name": "e.g. Football Analyst",
+    "position": "Their stance in 5-8 words",
+    "argument": "3-4 sentences with specific data, stats, names, dates",
+    "confidence": 85,
+    "key_data_point": "Single strongest fact supporting their view"
+  }},
+  "persona_b": {{
+    "name": "e.g. Sports Statistician",
+    "position": "Their opposing stance in 5-8 words",
+    "argument": "3-4 sentences with specific data, stats, names, dates that contradicts Persona A",
+    "confidence": 78,
+    "key_data_point": "Single strongest fact supporting their view"
+  }},
+  "winner": {{
+    "persona": "Persona A or Persona B name",
+    "final_verdict": "The definitive answer in 2-3 sentences",
+    "overall_rating": 8.5,
+    "why_won": "Why this argument was stronger with specific reasoning",
+    "key_data_points": ["fact 1", "fact 2", "fact 3", "fact 4", "fact 5"],
+    "confidence_level": "HIGH/MEDIUM/LOW",
+    "caveats": "What could change this verdict"
+  }},
+  "bottom_line": "One sentence final answer",
+  "dissenting_view": "Strongest point from the losing side"
 }}"""
 
     raw = call_nvidia(
@@ -178,61 +144,7 @@ Format your response as JSON:
             {"role": "user", "content": prompt}
         ],
         temperature=0.8,
-        max_tokens=4000
-    )
-    json_match = re.search(r'\{[\s\S]*\}', raw)
-    if json_match:
-        try:
-            return json.loads(json_match.group())
-        except:
-            pass
-    return {"raw": raw}
-
-def pick_winner(question: str, realtime_data: str, round1: dict, round2: dict) -> dict:
-    r1_summary = json.dumps(round1, indent=2)[:2000]
-    r2_summary = json.dumps(round2, indent=2)[:2000]
-
-    prompt = f"""QUESTION: {question}
-
-{realtime_data}
-
-ROUND 1 DATA: {r1_summary}
-ROUND 2 DATA: {r2_summary}
-
-TASK: Analyze both rounds and declare the winning argument. Be a strict judge.
-
-Format as JSON:
-{{
-  "winner": {{
-    "persona": "Winning persona type",
-    "final_verdict": "The definitive answer to the question in 2-3 sentences",
-    "overall_rating": 9.2,
-    "why_won": "Why this argument was stronger than others",
-    "key_data_points": ["data point 1", "data point 2", "data point 3", "data point 4", "data point 5"],
-    "confidence_level": "HIGH/MEDIUM/LOW",
-    "caveats": "What could change this verdict"
-  }},
-  "top_5": [
-    {{
-      "rank": 1,
-      "persona": "Persona name",
-      "position": "Their stance",
-      "score": 9.2,
-      "strongest_argument": "Their best point",
-      "weakness": "Where they fell short"
-    }}
-  ],
-  "bottom_line": "One sentence final answer",
-  "dissenting_view": "Strongest opposing argument that didn't win"
-}}"""
-
-    raw = call_nvidia(
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.4,
-        max_tokens=2000
+        max_tokens=3000
     )
     json_match = re.search(r'\{[\s\S]*\}', raw)
     if json_match:
@@ -243,7 +155,8 @@ Format as JSON:
     return {"raw": raw}
 
 def format_telegram_message(question: str, result: dict) -> str:
-    top5 = result.get("top_5", [])
+    pa = result.get("persona_a", {})
+    pb = result.get("persona_b", {})
     winner = result.get("winner", {})
     bottom_line = result.get("bottom_line", "")
     dissent = result.get("dissenting_view", "")
@@ -259,9 +172,23 @@ def format_telegram_message(question: str, result: dict) -> str:
         if s >= 6: return "🟢🟢⚪⚪⚪"
         return "🟢⚪⚪⚪⚪"
 
-    msg = "🧠 *100 BRAIN DEBATE COMPLETE*\n"
+    msg = "🧠 *2 BRAIN DEBATE COMPLETE*\n"
     msg += "━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"❓ *Question:* {question}\n\n"
+
+    msg += f"🔵 *{pa.get('name', 'Persona A')}*\n"
+    msg += f"   📍 _{pa.get('position', '')}_\n"
+    msg += f"   💬 {pa.get('argument', '')}\n"
+    msg += f"   🔑 {pa.get('key_data_point', '')}\n"
+    msg += f"   Confidence: `{pa.get('confidence', 0)}%`\n\n"
+
+    msg += f"🔴 *{pb.get('name', 'Persona B')}*\n"
+    msg += f"   📍 _{pb.get('position', '')}_\n"
+    msg += f"   💬 {pb.get('argument', '')}\n"
+    msg += f"   🔑 {pb.get('key_data_point', '')}\n"
+    msg += f"   Confidence: `{pb.get('confidence', 0)}%`\n\n"
+
+    msg += "━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"🏆 *WINNER: {winner.get('persona', 'Unknown')}*\n"
     msg += f"📊 Rating: `{winner.get('overall_rating', 0)}/10` {get_bar(winner.get('overall_rating', 0))}\n"
     msg += f"🎯 Confidence: `{winner.get('confidence_level', 'N/A')}`\n\n"
@@ -270,16 +197,6 @@ def format_telegram_message(question: str, result: dict) -> str:
     for i, dp in enumerate(winner.get('key_data_points', [])[:5], 1):
         msg += f"  {i}. {dp}\n"
     msg += "\n━━━━━━━━━━━━━━━━━━━━\n"
-    msg += "🔥 *TOP 5 DEBATERS:*\n\n"
-    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-    for i, debater in enumerate(top5[:5]):
-        score = debater.get('score', 0)
-        msg += f"{medals[i]} *{debater.get('persona', '')}*\n"
-        msg += f"   Score: `{score}/10` {get_bar(score)}\n"
-        msg += f"   📍 _{debater.get('position', '')}_\n"
-        msg += f"   💪 {debater.get('strongest_argument', '')}\n"
-        msg += f"   ⚠️ Weakness: {debater.get('weakness', '')}\n\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"💬 *BOTTOM LINE:*\n_{bottom_line}_\n\n"
     msg += f"🔴 *DISSENTING VIEW:*\n_{dissent}_\n\n"
     msg += "📄 _Full debate report attached as PDF_"
@@ -318,7 +235,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text(
             "🧠 *Debate in progress...*\n\n"
             "✅ Real-time data fetched\n"
-            "⚔️ Round 1: 100 brains forming positions...",
+            "⚔️ 2 experts debating...",
             parse_mode=ParseMode.MARKDOWN
         )
 
@@ -332,52 +249,56 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             realtime_data = f"IMAGE ANALYSIS:\n{image_analysis}\n\n{realtime_data}"
 
-        round1 = await asyncio.get_event_loop().run_in_executor(
-            None, run_debate_round, question, realtime_data, 1, ""
-        )
-
-        r1_summary = ""
-        positions = round1.get("positions", [])
-        if positions:
-            for p in positions[:20]:
-                r1_summary += f"- {p.get('persona', '')}: {p.get('position', '')} (confidence: {p.get('confidence', 0)}%)\n"
-
-        await status_msg.edit_text(
-            "🧠 *Debate in progress...*\n\n"
-            "✅ Real-time data fetched\n"
-            "✅ Round 1 complete — 100 positions formed\n"
-            "🔥 Round 2: Top debaters clashing...",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-        round2 = await asyncio.get_event_loop().run_in_executor(
-            None, run_debate_round, question, realtime_data, 2, r1_summary
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, run_debate, question, realtime_data
         )
 
         await status_msg.edit_text(
             "🧠 *Debate in progress...*\n\n"
             "✅ Real-time data fetched\n"
-            "✅ Round 1 complete\n"
-            "✅ Round 2 complete\n"
-            "⚖️ Picking winner...",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-        final_result = await asyncio.get_event_loop().run_in_executor(
-            None, pick_winner, question, realtime_data, round1, round2
-        )
-
-        await status_msg.edit_text(
-            "🧠 *Debate in progress...*\n\n"
-            "✅ Real-time data fetched\n"
-            "✅ Round 1 complete\n"
-            "✅ Round 2 complete\n"
-            "✅ Winner selected\n"
+            "✅ Debate complete\n"
             "📄 Generating PDF report...",
             parse_mode=ParseMode.MARKDOWN
         )
 
-        telegram_msg = format_telegram_message(question, final_result)
+        telegram_msg = format_telegram_message(question, result)
+
+        # Build dummy round1/round2 for PDF compatibility
+        round1 = {"positions": [
+            {"id": 1, "persona": result.get("persona_a", {}).get("name", "Persona A"),
+             "position": result.get("persona_a", {}).get("position", ""),
+             "argument": result.get("persona_a", {}).get("argument", ""),
+             "confidence": result.get("persona_a", {}).get("confidence", 0),
+             "key_data_point": result.get("persona_a", {}).get("key_data_point", "")},
+            {"id": 2, "persona": result.get("persona_b", {}).get("name", "Persona B"),
+             "position": result.get("persona_b", {}).get("position", ""),
+             "argument": result.get("persona_b", {}).get("argument", ""),
+             "confidence": result.get("persona_b", {}).get("confidence", 0),
+             "key_data_point": result.get("persona_b", {}).get("key_data_point", "")}
+        ]}
+        round2 = {"top_debaters": [], "eliminated": [], "emerging_consensus": "Single round debate"}
+
+        # Build top_5 from the 2 debaters for PDF
+        winner_name = result.get("winner", {}).get("persona", "")
+        pa_name = result.get("persona_a", {}).get("name", "Persona A")
+        pb_name = result.get("persona_b", {}).get("name", "Persona B")
+        final_result = {
+            "winner": result.get("winner", {}),
+            "top_5": [
+                {"rank": 1, "persona": pa_name,
+                 "position": result.get("persona_a", {}).get("position", ""),
+                 "score": result.get("winner", {}).get("overall_rating", 0) if winner_name == pa_name else round(result.get("winner", {}).get("overall_rating", 0) * 0.85, 1),
+                 "strongest_argument": result.get("persona_a", {}).get("key_data_point", ""),
+                 "weakness": "Lost the debate" if winner_name != pa_name else "Minor caveats only"},
+                {"rank": 2, "persona": pb_name,
+                 "position": result.get("persona_b", {}).get("position", ""),
+                 "score": result.get("winner", {}).get("overall_rating", 0) if winner_name == pb_name else round(result.get("winner", {}).get("overall_rating", 0) * 0.85, 1),
+                 "strongest_argument": result.get("persona_b", {}).get("key_data_point", ""),
+                 "weakness": "Lost the debate" if winner_name != pb_name else "Minor caveats only"},
+            ],
+            "bottom_line": result.get("bottom_line", ""),
+            "dissenting_view": result.get("dissenting_view", "")
+        }
 
         pdf_path = await asyncio.get_event_loop().run_in_executor(
             None, generate_debate_pdf, question, realtime_data, round1, round2, final_result
@@ -401,8 +322,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🧠 *100 BRAIN DEBATE BOT*\n\n"
-        "Send me any question and 100 AI personas will debate it using real-time data.\n\n"
+        "🧠 *2 BRAIN DEBATE BOT*\n\n"
+        "Send me any question and 2 AI experts will debate it using real-time data.\n\n"
         "📌 *Topics I handle:*\n"
         "⚽ Football, 🏏 Cricket, 🥊 UFC\n"
         "📈 Trading & Markets\n"
